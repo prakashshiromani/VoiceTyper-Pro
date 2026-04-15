@@ -216,7 +216,7 @@ def build_ui():
 
     apply_rounded_corners()
 
-    W, H = 210, 140
+    W, H = 210, 155
     sw, sh = popup.winfo_screenwidth(), popup.winfo_screenheight()
     popup.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2}")
 
@@ -281,14 +281,14 @@ def build_ui():
 
     # --- Status Bar ---
     status_bar = tk.Frame(body, bg=C_BG)
-    status_bar.pack(side="bottom", fill="x", pady=(5, 0))
+    status_bar.pack(side="bottom", fill="x", pady=(10, 5))
 
     energy_lbl = tk.Label(status_bar, text="mic: --", bg=C_BG, fg=BTN_START, font=("Segoe UI", 7))
-    energy_lbl.pack(side="left")
+    energy_lbl.pack(side="left", padx=(2, 0))
 
     tk.Label(status_bar, text="  |  ", bg=C_BG, fg=C_MID, font=("Segoe UI", 7)).pack(side="left")
 
-    shortcut_lbl = tk.Label(status_bar, text=f"Hotkey: {TOGGLE_HOTKEY.upper()}", bg=C_BG, fg=C_GREY, font=("Segoe UI", 7))
+    shortcut_lbl = tk.Label(status_bar, text=f"Hotkey: {TOGGLE_HOTKEY.upper()}", bg=C_BG, fg=C_LIGHT, font=("Segoe UI", 7))
     shortcut_lbl.pack(side="left")
 
     keyboard.add_hotkey(TOGGLE_HOTKEY, lambda: root.after(0, toggle_voice))
