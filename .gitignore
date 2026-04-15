@@ -1,0 +1,9 @@
+# Exclude skills.md from Git as requested
+skills.md
+
+# Ignore Python cache and build files
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
