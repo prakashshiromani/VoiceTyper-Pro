@@ -6,4 +6,5 @@ __pycache__/
 *.pyc
 build/
 dist/
-*.spec
+# *.spec  (Allowing it so users can rebuild)
+

@@ -279,8 +279,17 @@ def build_ui():
     ttk.Scale(r2, from_=1, to=10, variable=sens_var, length=60, style="C.Horizontal.TScale").pack(side="left", padx=2)
     tk.Label(r2, text="Noise", bg=C_BG, fg=BTN_STOP, font=("Segoe UI", 6)).pack(side="left")
 
-    energy_lbl = tk.Label(body, text="mic: --", bg=C_BG, fg=BTN_START, font=("Segoe UI", 7))
-    energy_lbl.pack(side="bottom", anchor="w")
+    # --- Status Bar ---
+    status_bar = tk.Frame(body, bg=C_BG)
+    status_bar.pack(side="bottom", fill="x", pady=(5, 0))
+
+    energy_lbl = tk.Label(status_bar, text="mic: --", bg=C_BG, fg=BTN_START, font=("Segoe UI", 7))
+    energy_lbl.pack(side="left")
+
+    tk.Label(status_bar, text="  |  ", bg=C_BG, fg=C_MID, font=("Segoe UI", 7)).pack(side="left")
+
+    shortcut_lbl = tk.Label(status_bar, text=f"Hotkey: {TOGGLE_HOTKEY.upper()}", bg=C_BG, fg=C_GREY, font=("Segoe UI", 7))
+    shortcut_lbl.pack(side="left")
 
     keyboard.add_hotkey(TOGGLE_HOTKEY, lambda: root.after(0, toggle_voice))
     root.after(80, pulse); root.after(100, update_mic_level)
