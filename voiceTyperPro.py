@@ -59,13 +59,31 @@ p_dir      = 1
 # --- 3. CORE LOGIC ---
 
 def smart_polish(text):
-    fillers = [r'\bum+\b', r'\buh+\b', r'\bah+\b', r'\blike\b']
+    # Expanded list of common fillers
+    fillers = [
+        r'\bum+\b', r'\buh+\b', r'\bah+\b', r'\blike\b', 
+        r'\byou know\b', r'\bactually\b', r'\bbasically\b', 
+        r'\bso\b', r'\bI mean\b'
+    ]
     for f in fillers: text = re.sub(f, '', text, flags=re.IGNORECASE)
+    
     low = text.lower().strip()
-    if "new line" in low: keyboard.press_and_release("enter"); return ""
-    if "backspace" in low: keyboard.press_and_release("backspace"); return ""
+    
+    # Integrated Voice Commands
+    if "new line" in low: 
+        keyboard.press_and_release("enter")
+        return ""
+    if "backspace" in low or "erase that" in low: 
+        keyboard.press_and_release("backspace")
+        return ""
+    if "tab space" in low:
+        keyboard.press_and_release("tab")
+        return ""
+        
     text = text.strip()
-    if len(text) > 1: text = text[0].upper() + text[1:]
+    # Improved capitalization: handle cases where speech might start with a lowercase letter
+    if len(text) > 0:
+        text = text[0].upper() + text[1:]
     return text
 
 def type_text(text):
