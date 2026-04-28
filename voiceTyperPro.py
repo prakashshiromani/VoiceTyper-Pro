@@ -1,13 +1,16 @@
 """
-VoiceTyper Pro — v19 (Ultra Speed Edition)
--------------------------------------------
-Speed overhaul:
-- Win32 SendInput API: ALL chars sent in ONE OS call — zero inter-char delay
-- Supports Hindi/Unicode natively — no clipboard needed anymore
+VoiceTyper Pro — v20 (Smart API Pool Edition)
+----------------------------------------------
+- keyboard.write (ASCII) + pyperclip clipboard (Hindi/Unicode)
 - Pre-compiled filler regex (9x faster text cleaning)
 - pause_threshold 0.3s, phrase_time_limit 5s
 - 3 parallel recognition workers
 - Smart bounded ambient recalibration
+- [NEW v20] SmartRecognizerPool — 4 recognizer instances with:
+    * Round-robin rotation
+    * Per-instance response-time tracking
+    * Auto-cooldown on slow/failed instances (30s)
+    * Automatic fallback to fastest available instance
 """
 
 import threading
@@ -15,51 +18,12 @@ import queue
 import time
 import sys
 import re
-import ctypes
 import tkinter as tk
 from tkinter import ttk
 
 import speech_recognition as sr
+import pyperclip
 import keyboard
-
-# --- Win32 SendInput structures (fastest possible typing on Windows) ---
-# Uses KEYEVENTF_UNICODE so ALL characters (ASCII + Hindi + any Unicode) work
-# without clipboard — everything is sent in a single OS call.
-_PUL = ctypes.POINTER(ctypes.c_ulong)
-
-class _KeyBdInput(ctypes.Structure):
-    _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort),
-                ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong),
-                ("dwExtraInfo", _PUL)]
-
-class _InputUnion(ctypes.Union):
-    _fields_ = [("ki", _KeyBdInput)]
-
-class _Input(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_ulong), ("ii", _InputUnion)]
-
-_KEYEVENTF_UNICODE = 0x0004
-_KEYEVENTF_KEYUP   = 0x0002
-_INPUT_KEYBOARD    = 1
-_extra             = ctypes.c_ulong(0)
-
-def _send_unicode(text):
-    """Type every character in `text` via a single SendInput call — zero delay."""
-    inputs = []
-    for ch in text:
-        code = ord(ch)
-        inputs.append(_Input(type=_INPUT_KEYBOARD,
-                             ii=_InputUnion(ki=_KeyBdInput(
-                                 wVk=0, wScan=code,
-                                 dwFlags=_KEYEVENTF_UNICODE,
-                                 time=0, dwExtraInfo=ctypes.pointer(_extra)))))
-        inputs.append(_Input(type=_INPUT_KEYBOARD,
-                             ii=_InputUnion(ki=_KeyBdInput(
-                                 wVk=0, wScan=code,
-                                 dwFlags=_KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP,
-                                 time=0, dwExtraInfo=ctypes.pointer(_extra)))))
-    arr = (_Input * len(inputs))(*inputs)
-    ctypes.windll.user32.SendInput(len(inputs), arr, ctypes.sizeof(_Input))
 
 # --- 1. CONFIG & PALETTE ---
 LANGUAGE        = "en-IN"
@@ -73,22 +37,139 @@ C_GREY    = "#707A8A"
 BTN_START = "#00D48A"
 BTN_STOP  = "#FF4C5E"
 
-# --- 2. GLOBAL STATE ---
-recognizer = sr.Recognizer()
-# SPEED TUNING:
-recognizer.pause_threshold            = 0.3   # 0.3s silence = phrase done (faster)
-recognizer.non_speaking_duration      = 0.2
-recognizer.phrase_threshold           = 0.1
-recognizer.energy_threshold           = 300
-# Keep dynamic OFF — we do our own smarter bounded recalibration in listen_loop
-# This prevents the threshold from shooting too high and dropping all speech.
-recognizer.dynamic_energy_threshold   = False
+# --- 2. SMART RECOGNIZER POOL ---
+
+NUM_POOL_INSTANCES = 4      # Number of recognizer instances in the pool
+SLOW_THRESHOLD_SEC = 3.5    # If a recognizer takes > this seconds → mark slow
+COOLDOWN_SEC       = 30     # Slow/failed recognizer stays on cooldown for 30s
+MAX_FAIL_STREAK    = 3      # 3 consecutive failures → trigger cooldown
+
+def _make_recognizer():
+    """Create and configure a single recognizer instance."""
+    r = sr.Recognizer()
+    r.pause_threshold          = 0.3
+    r.non_speaking_duration    = 0.2
+    r.phrase_threshold         = 0.1
+    r.energy_threshold         = 300
+    r.dynamic_energy_threshold = False
+    return r
+
+class RecognizerSlot:
+    """Tracks one recognizer instance and its health metrics."""
+    def __init__(self, idx):
+        self.idx          = idx
+        self.recognizer   = _make_recognizer()
+        self.avg_ms       = 0.0      # Exponential moving average of response time (ms)
+        self.fail_streak  = 0        # Consecutive RequestError / timeout failures
+        self.cooldown_until = 0.0    # epoch time until which this slot is on cooldown
+        self._lock        = threading.Lock()
+
+    @property
+    def is_available(self):
+        return time.time() >= self.cooldown_until
+
+    def mark_success(self, elapsed_sec):
+        """Called when recognition succeeded. Update avg response time."""
+        with self._lock:
+            ms = elapsed_sec * 1000
+            # Exponential moving average — recent results weigh more
+            self.avg_ms      = ms if self.avg_ms == 0 else 0.3 * ms + 0.7 * self.avg_ms
+            self.fail_streak = 0
+            # If consistently slow, put on brief cooldown
+            if elapsed_sec > SLOW_THRESHOLD_SEC:
+                self.cooldown_until = time.time() + COOLDOWN_SEC
+                print(f"[Pool #{self.idx}] Slow ({elapsed_sec:.1f}s) → cooldown {COOLDOWN_SEC}s")
+
+    def mark_failure(self):
+        """Called on RequestError or timeout. Increments fail streak."""
+        with self._lock:
+            self.fail_streak += 1
+            if self.fail_streak >= MAX_FAIL_STREAK:
+                self.cooldown_until = time.time() + COOLDOWN_SEC
+                print(f"[Pool #{self.idx}] {self.fail_streak} failures → cooldown {COOLDOWN_SEC}s")
+
+    def mark_unknown(self):
+        """UnknownValueError — speech not understood — not a failure, reset streak."""
+        with self._lock:
+            self.fail_streak = 0
+
+
+class SmartRecognizerPool:
+    """
+    Pool of NUM_POOL_INSTANCES recognizer instances.
+    Strategy:
+      1. Filter out slots on cooldown.
+      2. Among available slots, pick the one with lowest avg response time.
+      3. If all are on cooldown, wait and pick the one whose cooldown expires soonest.
+    """
+    def __init__(self, n):
+        self.slots   = [RecognizerSlot(i) for i in range(n)]
+        self._rr_idx = 0          # Round-robin fallback index
+        self._lock   = threading.Lock()
+
+    def get_best(self):
+        """Return the best available RecognizerSlot (non-blocking)."""
+        with self._lock:
+            available = [s for s in self.slots if s.is_available]
+            if available:
+                # Prefer lowest avg response time; break ties by round-robin
+                best = min(available, key=lambda s: s.avg_ms if s.avg_ms > 0 else float("inf"))
+                return best
+            # All on cooldown — pick the one whose cooldown expires soonest
+            soonest = min(self.slots, key=lambda s: s.cooldown_until)
+            remaining = soonest.cooldown_until - time.time()
+            print(f"[Pool] All on cooldown — waiting {remaining:.1f}s for #{soonest.idx}")
+            return soonest   # caller will block waiting; best we can do
+
+    def recognize(self, audio, language):
+        """
+        Attempt recognition using the best available slot.
+        On slow/fail, automatically retry with the next best slot (up to len(slots) attempts).
+        Returns text string or raises sr.UnknownValueError if nothing heard.
+        """
+        attempts = len(self.slots)
+        tried    = set()
+
+        for _ in range(attempts):
+            slot = self.get_best()
+            if slot.idx in tried:
+                # All unique slots exhausted
+                break
+            tried.add(slot.idx)
+
+            t0 = time.time()
+            try:
+                text    = slot.recognizer.recognize_google(audio, language=language)
+                elapsed = time.time() - t0
+                slot.mark_success(elapsed)
+                print(f"[Pool #{slot.idx}] OK  {elapsed*1000:.0f}ms  avg={slot.avg_ms:.0f}ms")
+                return text
+            except sr.UnknownValueError:
+                slot.mark_unknown()
+                raise   # Genuine "didn't hear" — don't retry
+            except sr.RequestError as e:
+                slot.mark_failure()
+                print(f"[Pool #{slot.idx}] RequestError: {e} — trying next slot")
+                # Loop continues → picks next best slot
+            except Exception as e:
+                slot.mark_failure()
+                print(f"[Pool #{slot.idx}] Error: {e} — trying next slot")
+
+        raise sr.RequestError("All pool slots exhausted without result")
+
+
+# Singleton pool used by all worker threads
+_pool = SmartRecognizerPool(NUM_POOL_INSTANCES)
+
+# --- 3. GLOBAL STATE (listener uses slot 0's recognizer for calibration) ---
+
+# The primary recognizer used in listen_loop for mic calibration
+recognizer = _pool.slots[0].recognizer
 
 # Smart calibration constants
 CALIB_INTERVAL = 10   # Seconds of silence before recalibrating ambient noise
 CALIB_DURATION = 0.15 # How long (sec) each recalibration sample takes
 THRESH_FLOOR   = 150  # Never go below this (would pick up everything)
-                       # Ceiling is set by sensitivity slider at runtime
 
 try: mic = sr.Microphone()
 except: print("Mic error"); sys.exit(1)
@@ -96,7 +177,7 @@ except: print("Mic error"); sys.exit(1)
 listening      = False
 session_id     = 0
 audio_queue    = queue.Queue(maxsize=30)   # Larger buffer so audio is never dropped
-NUM_WORKERS    = 3                         # Parallel recognition threads
+NUM_WORKERS    = 3                          # Parallel recognition threads
 
 # UI Widgets
 root       = None
@@ -106,6 +187,7 @@ btn_lbl    = None
 dot_cv     = None
 lang_var   = None
 sens_var   = None
+energy_lbl = None
 chips      = {}
 
 # Animation
@@ -113,7 +195,7 @@ p_active   = False
 p_alpha    = 0.0
 p_dir      = 1
 
-# --- 3. CORE LOGIC ---
+# --- 4. CORE LOGIC ---
 
 # Pre-compile all filler patterns into ONE regex — 9x faster than looping re.sub
 _FILLERS_RE = re.compile(
@@ -138,20 +220,26 @@ def type_text(text):
     text = smart_polish(text)
     if not text: return
     try:
-        # Win32 SendInput: works for ALL Unicode (ASCII + Hindi + any language)
-        # Sends every character in ONE single OS call — absolute fastest on Windows
-        _send_unicode(text + " ")
-    except:
-        # Fallback: keyboard.write (ASCII only, but reliable)
-        try: keyboard.write(text + " ", delay=0.0)
-        except: pass
+        try:
+            # ASCII: direct keyboard simulation — fast and reliable
+            text.encode("ascii")
+            keyboard.write(text + " ", delay=0.002)
+        except UnicodeEncodeError:
+            # Hindi / non-ASCII: clipboard paste — 100% accurate for all scripts
+            old = pyperclip.paste()
+            pyperclip.copy(text + " ")
+            time.sleep(0.02)
+            keyboard.press_and_release("ctrl+v")
+            time.sleep(0.02)
+            try: pyperclip.copy(old)
+            except: pass
+    except: pass
 
-# --- 4. ULTIMATE WINDOW MANAGEMENT (v17) ---
+# --- 5. ULTIMATE WINDOW MANAGEMENT ---
 
 def apply_rounded_corners():
     try:
         from ctypes import windll, c_int, byref, sizeof
-        # We need the HWND of the popup Toplevel
         HWND = windll.user32.GetParent(popup.winfo_id())
         windll.dwmapi.DwmSetWindowAttribute(HWND, 33, byref(c_int(2)), sizeof(c_int))
     except: pass
@@ -173,7 +261,7 @@ def on_master_unmap(event):
     if str(event.widget) == "." and popup:
         popup.withdraw()
 
-# --- 5. ENGINE LOOPS ---
+# --- 6. ENGINE LOOPS ---
 
 def listen_loop():
     global listening
@@ -188,52 +276,57 @@ def listen_loop():
                     audio = recognizer.listen(source, timeout=0.5, phrase_time_limit=5)
                     if not listening or session_id != sid: break
                     audio_queue.put((audio, sid))  # blocking put — never drop chunks
-                    last_calib_time = time.time()  # Reset timer: speech detected, env is fine
+                    last_calib_time = time.time()  # Reset timer: speech detected
                 except sr.WaitTimeoutError:
                     # ── SMART AMBIENT RECALIBRATION ──────────────────────────────
-                    # WaitTimeoutError = silence window = safe to recalibrate.
-                    # We're already inside the open mic context so no conflict.
                     now = time.time()
                     if now - last_calib_time >= CALIB_INTERVAL:
                         recognizer.adjust_for_ambient_noise(source, duration=CALIB_DURATION)
-                        # Clamp: floor so we don't become too sensitive,
-                        # ceiling from the slider so we never miss speech
                         cap = int(800 + (sens_var.get() - 1) * 400)
                         recognizer.energy_threshold = max(THRESH_FLOOR,
                                                          min(recognizer.energy_threshold, cap))
+                        # Sync new threshold to ALL pool slots so they stay in sync
+                        for slot in _pool.slots:
+                            slot.recognizer.energy_threshold = recognizer.energy_threshold
                         last_calib_time = now
                 except: pass
     except: pass
 
 def proc_worker(sid):
-    """A single recognition worker — runs in its own thread."""
+    """A single recognition worker — uses SmartRecognizerPool for API rotation."""
     while True:
         try:
             item = audio_queue.get(timeout=0.5)
         except queue.Empty:
-            # If listening stopped and queue is drained, exit worker
             if not listening:
                 break
             continue
+
         audio, audio_sid = item
         if audio_sid != sid:
             audio_queue.task_done()
             continue
+
         try:
             _lang = lang_var.get()
             lang  = _lang if _lang != "auto" else None
-            text = recognizer.recognize_google(audio, language=lang)
+
+            # ── SMART POOL CALL — auto-rotates on slow/failure ──────────────
+            text = _pool.recognize(audio, language=lang)
             if text: type_text(text)
+
         except sr.UnknownValueError:
             pass  # Speech not understood — normal, skip silently
-        except sr.RequestError:
-            pass  # Network issue — skip
-        except: pass
+        except sr.RequestError as e:
+            print(f"[Worker] All slots failed: {e}")
+        except Exception as e:
+            print(f"[Worker] Unexpected: {e}")
         finally:
             audio_queue.task_done()
+
     safe(lambda: toggle_active(False))
 
-# --- 6. UI CONTROLS ---
+# --- 7. UI CONTROLS ---
 
 def safe(fn):
     try:
@@ -257,17 +350,14 @@ def toggle_voice(*_):
         listening = True
         session_id += 1
         toggle_active(True)
-        # 1 listener thread captures audio
         threading.Thread(target=listen_loop, daemon=True).start()
-        # NUM_WORKERS parallel threads process audio simultaneously
-        # so one slow API call doesn't block the next chunk
         for _ in range(NUM_WORKERS):
             threading.Thread(target=proc_worker, args=(session_id,), daemon=True).start()
     else:
         listening = False
         session_id += 1
 
-# --- 7. UI CONSTRUCTION ---
+# --- 8. UI CONSTRUCTION ---
 
 class LangChip(tk.Label):
     def __init__(self, parent, text, code):
@@ -297,7 +387,11 @@ def update_mic_level():
         col = BTN_START if val < 1000 else "#FFB347" if val < 2500 else BTN_STOP
         energy_lbl.config(text=f"mic: {val}", fg=col)
         cap = int(800 + (sens_var.get() - 1) * 400)
-        if recognizer.energy_threshold > cap: recognizer.energy_threshold = cap
+        if recognizer.energy_threshold > cap:
+            recognizer.energy_threshold = cap
+            # Sync cap to all pool slots
+            for slot in _pool.slots:
+                slot.recognizer.energy_threshold = cap
         root.after(100, update_mic_level)
 
 def build_ui():
@@ -307,13 +401,13 @@ def build_ui():
     root = tk.Tk()
     root.title("VT Pro")
     root.geometry("1x1+0+0")
-    root.attributes("-alpha", 0.0) # Completely invisible
+    root.attributes("-alpha", 0.0)
     root.bind("<Map>", on_master_map)
     root.bind("<Unmap>", on_master_unmap)
 
     # UI WINDOW (The Premium Micro UI)
     popup = tk.Toplevel(root)
-    popup.overrideredirect(True) # Permanent borderless
+    popup.overrideredirect(True)
     popup.attributes("-topmost", True)
     popup.configure(bg=C_BG)
 
@@ -332,26 +426,23 @@ def build_ui():
     # --- Header ---
     hdr = tk.Frame(main_frame, bg=C_BG)
     hdr.pack(fill="x", padx=8, pady=(8, 4))
-    
-    # Blinking Dot on Far Left
+
     dot_cv = tk.Canvas(hdr, width=10, height=10, bg=C_BG, highlightthickness=0)
     dot_cv.pack(side="left", padx=(0, 5))
     dot_cv.create_oval(1, 1, 9, 9, fill=C_MID, tags="dot")
 
     tk.Label(hdr, text="Voice", bg=C_BG, fg=C_CYAN, font=("Segoe UI", 9, "bold")).pack(side="left")
     tk.Label(hdr, text="Typer pro", bg=C_BG, fg=C_LIGHT, font=("Segoe UI", 8)).pack(side="left")
-    
-    # Buttons Container
+
     box = tk.Frame(hdr, bg=C_BG)
     box.pack(side="right")
-    
-    # Larger Click Hitboxes for Min/Close
+
     mn = tk.Label(box, text=" — ", bg=C_BG, fg=C_GREY, font=("Segoe UI", 10, "bold"), cursor="hand2")
     mn.pack(side="left")
     mn.bind("<Button-1>", lambda e: minimize_window())
     mn.bind("<Enter>", lambda e: mn.config(fg=C_CYAN))
     mn.bind("<Leave>", lambda e: mn.config(fg=C_GREY))
-    
+
     cl = tk.Label(box, text=" ✕ ", bg=C_BG, fg=C_GREY, font=("Segoe UI", 10, "bold"), cursor="hand2")
     cl.pack(side="left")
     cl.bind("<Button-1>", lambda e: sys.exit(0))
