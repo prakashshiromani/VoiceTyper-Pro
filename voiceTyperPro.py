@@ -35,15 +35,19 @@ BTN_STOP  = "#FF4C5E"
 # --- 2. GLOBAL STATE ---
 recognizer = sr.Recognizer()
 # SPEED TUNING:
-# pause_threshold: How long (sec) of silence to wait before considering the phrase complete.
-# Lower = faster response after you stop speaking. 0.4 is snappy but not choppy.
-recognizer.pause_threshold            = 0.4
+recognizer.pause_threshold            = 0.4   # 0.4s silence = phrase done (snappy)
 recognizer.non_speaking_duration      = 0.3
 recognizer.phrase_threshold           = 0.1
 recognizer.energy_threshold           = 300
-# Disable dynamic adjustment — prevents the recognizer from raising the threshold
-# so high that it stops hearing you (the main cause of "sometimes doesn't type").
+# Keep dynamic OFF — we do our own smarter bounded recalibration in listen_loop
+# This prevents the threshold from shooting too high and dropping all speech.
 recognizer.dynamic_energy_threshold   = False
+
+# Smart calibration constants
+CALIB_INTERVAL = 10   # Seconds of silence before recalibrating ambient noise
+CALIB_DURATION = 0.15 # How long (sec) each recalibration sample takes
+THRESH_FLOOR   = 150  # Never go below this (would pick up everything)
+                       # Ceiling is set by sensitivity slider at runtime
 
 try: mic = sr.Microphone()
 except: print("Mic error"); sys.exit(1)
@@ -149,19 +153,30 @@ def on_master_unmap(event):
 def listen_loop():
     global listening
     sid = session_id
+    last_calib_time = time.time()
     try:
         with mic as source:
-            # Reduced from 0.3s → 0.1s — faster startup, still effective
+            # Initial quick calibration on startup
             recognizer.adjust_for_ambient_noise(source, duration=0.1)
             while listening and session_id == sid:
                 try:
-                    # timeout=0.5: don't wait too long for speech to begin
-                    # phrase_time_limit=8: cap phrases at 8s to avoid stalls
                     audio = recognizer.listen(source, timeout=0.5, phrase_time_limit=8)
                     if not listening or session_id != sid: break
                     audio_queue.put((audio, sid))  # blocking put — never drop chunks
+                    last_calib_time = time.time()  # Reset timer: speech detected, env is fine
                 except sr.WaitTimeoutError:
-                    pass  # Normal: no speech in this window, keep looping
+                    # ── SMART AMBIENT RECALIBRATION ──────────────────────────────
+                    # WaitTimeoutError = silence window = safe to recalibrate.
+                    # We're already inside the open mic context so no conflict.
+                    now = time.time()
+                    if now - last_calib_time >= CALIB_INTERVAL:
+                        recognizer.adjust_for_ambient_noise(source, duration=CALIB_DURATION)
+                        # Clamp: floor so we don't become too sensitive,
+                        # ceiling from the slider so we never miss speech
+                        cap = int(800 + (sens_var.get() - 1) * 400)
+                        recognizer.energy_threshold = max(THRESH_FLOOR,
+                                                         min(recognizer.energy_threshold, cap))
+                        last_calib_time = now
                 except: pass
     except: pass
 
