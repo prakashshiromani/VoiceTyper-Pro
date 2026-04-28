@@ -1,8 +1,11 @@
 """
-VoiceTyper Pro — v17 (The Dummy Root Solution)
-----------------------------------------------
-The industry-standard fix for borderless Tkinter windows on Windows.
-Uses an invisible master window to handle taskbar/minimize perfectly.
+VoiceTyper Pro — v18 (Speed Edition)
+-------------------------------------
+Major performance overhaul:
+- Near-zero keyboard typing delay
+- Parallel audio recognition workers
+- Disabled dynamic energy threshold to prevent speech drops
+- Faster clipboard injection for Hindi/special chars
 """
 
 import threading
@@ -31,15 +34,24 @@ BTN_STOP  = "#FF4C5E"
 
 # --- 2. GLOBAL STATE ---
 recognizer = sr.Recognizer()
-recognizer.pause_threshold = 0.8
-recognizer.energy_threshold = 200
+# SPEED TUNING:
+# pause_threshold: How long (sec) of silence to wait before considering the phrase complete.
+# Lower = faster response after you stop speaking. 0.4 is snappy but not choppy.
+recognizer.pause_threshold            = 0.4
+recognizer.non_speaking_duration      = 0.3
+recognizer.phrase_threshold           = 0.1
+recognizer.energy_threshold           = 300
+# Disable dynamic adjustment — prevents the recognizer from raising the threshold
+# so high that it stops hearing you (the main cause of "sometimes doesn't type").
+recognizer.dynamic_energy_threshold   = False
 
 try: mic = sr.Microphone()
 except: print("Mic error"); sys.exit(1)
 
 listening      = False
 session_id     = 0
-audio_queue    = queue.Queue(maxsize=15)
+audio_queue    = queue.Queue(maxsize=30)   # Larger buffer so audio is never dropped
+NUM_WORKERS    = 3                         # Parallel recognition threads
 
 # UI Widgets
 root       = None
@@ -91,10 +103,16 @@ def type_text(text):
     if not text: return
     try:
         try:
-            text.encode("ascii"); keyboard.write(text + " ", delay=0.012)
+            # ASCII path: delay reduced from 0.012 → 0.002 (6x faster keyboard simulation)
+            text.encode("ascii"); keyboard.write(text + " ", delay=0.002)
         except:
-            old = pyperclip.paste(); pyperclip.copy(text + " ")
-            time.sleep(0.04); keyboard.press_and_release("ctrl+v"); time.sleep(0.04)
+            # Non-ASCII (Hindi/special chars): use clipboard injection
+            # Sleeps reduced from 40ms → 20ms for faster paste
+            old = pyperclip.paste()
+            pyperclip.copy(text + " ")
+            time.sleep(0.02)
+            keyboard.press_and_release("ctrl+v")
+            time.sleep(0.02)
             try: pyperclip.copy(old)
             except: pass
     except: pass
@@ -133,27 +151,45 @@ def listen_loop():
     sid = session_id
     try:
         with mic as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.3)
+            # Reduced from 0.3s → 0.1s — faster startup, still effective
+            recognizer.adjust_for_ambient_noise(source, duration=0.1)
             while listening and session_id == sid:
                 try:
-                    audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=12)
+                    # timeout=0.5: don't wait too long for speech to begin
+                    # phrase_time_limit=8: cap phrases at 8s to avoid stalls
+                    audio = recognizer.listen(source, timeout=0.5, phrase_time_limit=8)
                     if not listening or session_id != sid: break
-                    audio_queue.put_nowait((audio, sid))
+                    audio_queue.put((audio, sid))  # blocking put — never drop chunks
+                except sr.WaitTimeoutError:
+                    pass  # Normal: no speech in this window, keep looping
                 except: pass
     except: pass
 
-def proc_loop():
-    global listening
-    sid = session_id
-    while listening or not audio_queue.empty():
-        try: item = audio_queue.get(timeout=0.5)
-        except: continue
-        audio, audio_sid = item
-        if audio_sid != sid: continue
+def proc_worker(sid):
+    """A single recognition worker — runs in its own thread."""
+    while True:
         try:
-            text = recognizer.recognize_google(audio, language=lang_var.get())
+            item = audio_queue.get(timeout=0.5)
+        except queue.Empty:
+            # If listening stopped and queue is drained, exit worker
+            if not listening:
+                break
+            continue
+        audio, audio_sid = item
+        if audio_sid != sid:
+            audio_queue.task_done()
+            continue
+        try:
+            lang = lang_var.get() if lang_var.get() != "auto" else None
+            text = recognizer.recognize_google(audio, language=lang)
             if text: type_text(text)
+        except sr.UnknownValueError:
+            pass  # Speech not understood — normal, skip silently
+        except sr.RequestError:
+            pass  # Network issue — skip
         except: pass
+        finally:
+            audio_queue.task_done()
     safe(lambda: toggle_active(False))
 
 # --- 6. UI CONTROLS ---
@@ -177,10 +213,18 @@ def toggle_active(active):
 def toggle_voice(*_):
     global listening, session_id
     if not listening:
-        listening = True; session_id += 1; toggle_active(True)
+        listening = True
+        session_id += 1
+        toggle_active(True)
+        # 1 listener thread captures audio
         threading.Thread(target=listen_loop, daemon=True).start()
-        threading.Thread(target=proc_loop, daemon=True).start()
-    else: listening = False; session_id += 1
+        # NUM_WORKERS parallel threads process audio simultaneously
+        # so one slow API call doesn't block the next chunk
+        for _ in range(NUM_WORKERS):
+            threading.Thread(target=proc_worker, args=(session_id,), daemon=True).start()
+    else:
+        listening = False
+        session_id += 1
 
 # --- 7. UI CONSTRUCTION ---
 
